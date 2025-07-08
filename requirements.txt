@@ -1,0 +1,11 @@
+torch
+numpy
+transformers
+spacy
+beautifulsoup4
+sentence-transformers
+faiss-cpu
+requests
+pandas
+openpyxl
+xlrd

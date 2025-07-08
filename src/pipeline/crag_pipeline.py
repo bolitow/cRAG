@@ -4,13 +4,13 @@ import time
 from datetime import datetime
 
 # Imports de tous nos composants
-from retrieval.embedder import DocumentEmbedder
-from retrieval.vector_store import VectorStore
-from retrieval.retriever import BaseRetriever
-from grading.knowledge_stripper import KnowledgeStripper
-from grading.relevance_grader import RelevanceGrader
-from refinement.knowledge_refiner import KnowledgeRefiner
-from generation.response_generator import ResponseGenerator, GeneratedResponse
+from src.retrieval.embedder import DocumentEmbedder
+from src.retrieval.vector_store import VectorStore
+from src.retrieval.retriever import BaseRetriever
+from src.grading.knowledge_stripper import KnowledgeStripper
+from src.grading.relevance_grader import RelevanceGrader
+from src.refinement.knowledge_refiner import KnowledgeRefiner
+from src.generation.response_generator import ResponseGenerator, GeneratedResponse
 
 
 @dataclass
