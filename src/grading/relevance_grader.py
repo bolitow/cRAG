@@ -5,6 +5,7 @@ import numpy as np
 from dataclasses import dataclass
 from enum import Enum
 import re
+from .audit_relevance_rules import AuditRelevanceAnalyzer, AuditContext
 
 
 class RelevanceScore(Enum):
@@ -27,6 +28,7 @@ class GradedStrip:
     confidence: float
     reasoning: str
     relevance_category: RelevanceScore
+    audit_context: AuditContext
 
 
 class RelevanceGrader:
@@ -43,13 +45,16 @@ class RelevanceGrader:
     def __init__(self,
                  model_name: Optional[str] = None,
                  use_llm: bool = True,
-                 embedder=None):
+                 embedder=None,
+                 enable_audit_rules: bool = True):  # Nouveau paramètre
         """
         Args:
-            model_name: Nom du modèle pour le grading (ex: "google/gemma-1b")
+            model_name: Nom du modèle pour le grading
             use_llm: Utiliser un LLM pour le grading
             embedder: Embedder pour calculer les similarités
+            enable_audit_rules: Activer les règles spécifiques aux audits
         """
+
         self.use_llm = use_llm
         self.embedder = embedder
 
@@ -67,6 +72,11 @@ class RelevanceGrader:
                 print(f"⚠️ Impossible de charger le modèle : {e}")
                 print("Fallback sur les heuristiques")
                 self.use_llm = False
+
+        # Initialiser l'analyseur d'audit si activé
+        self.enable_audit_rules = enable_audit_rules
+        if self.enable_audit_rules:
+            self.audit_analyzer = AuditRelevanceAnalyzer()
 
         # Patterns pour détecter différents types de pertinence
         self._init_patterns()
@@ -138,23 +148,40 @@ class RelevanceGrader:
     def grade_strips(self,
                      query: str,
                      strips: List['KnowledgeStrip'],
-                     detailed: bool = True) -> List[GradedStrip]:
+                     detailed: bool = True,
+                     audit_metadata: Optional[Dict] = None) -> List[GradedStrip]:
         """
         Évalue la pertinence de chaque strip par rapport à la requête.
+
+        Version améliorée avec prise en compte du contexte d'audit.
 
         Args:
             query: La question/requête de l'utilisateur
             strips: Liste des knowledge strips à évaluer
             detailed: Si True, fournit un raisonnement détaillé
+            audit_metadata: Métadonnées sur le contexte d'audit (nouveau)
 
         Returns:
             Liste de GradedStrips triés par pertinence
         """
         graded_strips = []
 
+        # Détecter le contexte d'audit si les règles sont activées
+        audit_context = None
+        if self.enable_audit_rules and self.audit_analyzer:
+            audit_context = self.audit_analyzer.detect_audit_context(query, audit_metadata)
+            print(f"Contexte d'audit détecté : {audit_context.value}")
+
         # Extraire les concepts clés de la requête
         query_concepts = self._extract_key_concepts(query)
         main_concept = self._extract_main_concept(query)
+
+        # Si contexte d'audit, enrichir avec les mots-clés spécifiques
+        if audit_context and self.enable_audit_rules:
+            audit_keywords = self.audit_analyzer.get_audit_specific_keywords(audit_context)
+            # Ajouter les mots-clés critiques aux concepts
+            for keyword in audit_keywords.get('critical', []):
+                query_concepts[keyword] = 1.2  # Poids élevé pour les éléments critiques
 
         for strip in strips:
             # Calculer plusieurs scores de pertinence
@@ -181,8 +208,27 @@ class RelevanceGrader:
             if self.use_llm:
                 scores['llm'] = self._compute_llm_relevance(query, strip.content)
 
+            # NOUVEAU : Score d'audit si activé
+            if self.enable_audit_rules and audit_context:
+                # Le score de base est la moyenne des autres scores
+                base_score = sum(scores.values()) / len(scores) if scores else 0.5
+
+                # Calculer le bonus d'audit
+                audit_adjusted_score, audit_explanation = self.audit_analyzer.calculate_audit_relevance_bonus(
+                    query=query,
+                    strip=strip,
+                    base_score=base_score,
+                    metadata=audit_metadata
+                )
+
+                scores['audit'] = audit_adjusted_score
+
+                # Stocker l'explication pour le raisonnement
+                if 'audit_reasoning' not in strip.context:
+                    strip.context['audit_reasoning'] = audit_explanation
+
             # Combiner les scores avec des poids ajustés
-            final_score, confidence = self._combine_scores_enhanced(scores)
+            final_score, confidence = self._combine_scores_enhanced(scores, audit_context)
 
             # Post-processing pour éviter les anomalies
             final_score = self._post_process_score(final_score, strip, query, main_concept)
@@ -198,11 +244,16 @@ class RelevanceGrader:
                 relevance_score=final_score,
                 confidence=confidence,
                 reasoning=reasoning,
-                relevance_category=category
+                relevance_category=category,
+                audit_context=audit_context  # Nouveau champ
             ))
 
         # Trier par score décroissant
         graded_strips.sort(key=lambda x: x.relevance_score, reverse=True)
+
+        # Si contexte d'audit, vérifier la complétude
+        if self.enable_audit_rules and audit_context:
+            self._check_audit_completeness(query, graded_strips, audit_context, audit_metadata)
 
         return graded_strips
 
@@ -509,26 +560,32 @@ Score :"""
             # En cas d'erreur, retourner un score neutre
             return 0.5
 
-    def _combine_scores_enhanced(self, scores: Dict[str, float]) -> Tuple[float, float]:
+    def _combine_scores_enhanced(self, scores: Dict[str, float], audit_context=None) -> Tuple[float, float]:
         """
-        Version améliorée de la combinaison des scores.
-
-        Changements principaux :
-        - Réduction du poids de la similarité sémantique
-        - Augmentation du poids des mots-clés et concepts
-        - Ajout du score conceptuel
+        Version améliorée de la combinaison des scores avec prise en compte du contexte d'audit.
         """
         if not scores:
             return 0.5, 0.0
 
-        # Nouvelles pondérations
-        weights = {
-            'semantic': 0.20,  # Réduit de 0.35
-            'keyword': 0.30,  # Augmenté de 0.25
-            'content_type': 0.20,  # Inchangé
-            'conceptual': 0.25,  # Nouveau
-            'llm': 0.05  # Réduit si présent
-        }
+        # Pondérations adaptatives selon le contexte
+        if audit_context and 'audit' in scores:
+            # En contexte d'audit, le score d'audit est prépondérant
+            weights = {
+                'audit': 0.40,  # Le plus important
+                'keyword': 0.20,  # Toujours important
+                'conceptual': 0.15,  # Concepts liés
+                'content_type': 0.15,  # Type de contenu
+                'semantic': 0.10  # Moins important en audit
+            }
+        else:
+            # Pondérations originales si pas de contexte d'audit
+            weights = {
+                'semantic': 0.20,
+                'keyword': 0.30,
+                'content_type': 0.20,
+                'conceptual': 0.25,
+                'llm': 0.05
+            }
 
         # Calculer la moyenne pondérée
         total_weight = 0
@@ -541,16 +598,49 @@ Score :"""
 
         final_score = weighted_sum / total_weight if total_weight > 0 else 0.5
 
-        # Calculer la confiance
+        # Calculer la confiance (plus élevée si on a un contexte d'audit clair)
         if len(scores) > 1:
-            # Si tous les scores sont cohérents, haute confiance
             variance = np.var(list(scores.values()))
-            confidence = 1 - (variance * 2)  # Amplifier l'effet de la variance
-            confidence = max(0.1, min(1.0, confidence))  # Borner entre 0.1 et 1.0
+            confidence = 1 - (variance * 2)
+
+            # Bonus de confiance si contexte d'audit détecté
+            if audit_context and 'audit' in scores:
+                confidence += 0.1
+
+            confidence = max(0.1, min(1.0, confidence))
         else:
             confidence = 0.5
 
         return final_score, confidence
+
+    def _check_audit_completeness(self,
+                                  query: str,
+                                  graded_strips: List[GradedStrip],
+                                  audit_context: AuditContext,
+                                  audit_metadata: Optional[Dict]):
+        """
+        Vérifie si les strips trouvés sont suffisants pour répondre à la question d'audit.
+
+        Cette méthode ajoute des métadonnées sur la complétude de la réponse.
+        """
+        if not self.audit_analyzer:
+            return
+
+        # Obtenir les suggestions d'éléments manquants
+        suggestions = self.audit_analyzer.suggest_missing_elements(
+            query=query,
+            found_strips=graded_strips,
+            context=audit_context
+        )
+
+        # Stocker les suggestions dans les métadonnées du premier strip
+        # (ou créer un strip spécial pour les métadonnées)
+        if graded_strips and suggestions:
+            graded_strips[0].strip.context['audit_completeness'] = {
+                'is_complete': len(suggestions) == 0,
+                'missing_elements': suggestions,
+                'audit_context': audit_context.value
+            }
 
     def _post_process_score(self,
                             score: float,
@@ -609,9 +699,7 @@ Score :"""
                             scores: Dict[str, float],
                             detailed: bool) -> str:
         """
-        Génère une explication du score de pertinence.
-
-        C'est important pour le débogage et la transparence du système.
+        Version améliorée qui inclut le raisonnement d'audit.
         """
         if not detailed:
             return f"Score global : {sum(scores.values()) / len(scores):.2f}"
@@ -627,6 +715,10 @@ Score :"""
 
         if 'conceptual' in scores and scores['conceptual'] > 0.5:
             reasoning_parts.append(f"Pertinence conceptuelle : {scores['conceptual']:.2f}")
+
+        # Ajouter le raisonnement d'audit si disponible
+        if 'audit' in scores and 'audit_reasoning' in strip.context:
+            reasoning_parts.append(f"Audit : {strip.context['audit_reasoning']}")
 
         if 'content_type' in scores:
             type_msg = f"Type '{strip.strip_type}' "
